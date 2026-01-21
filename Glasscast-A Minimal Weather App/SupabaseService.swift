@@ -11,7 +11,7 @@ import Combine
 // Minimal session holder. Replace with real auth integration later.
 final class AppSession: ObservableObject, @unchecked Sendable {
     @Published var currentUserID: UUID
-
+    
     init(currentUserID: UUID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!) {
         self.currentUserID = currentUserID
     }
@@ -22,7 +22,7 @@ struct FavoriteCity: Identifiable, Codable, Equatable, Sendable {
     let user_id: UUID
     let city: String
     let created_at: Date?
-
+    
     var userID: UUID { user_id }
 }
 
@@ -38,18 +38,23 @@ final class SupabaseService: SupabaseFavoriting, @unchecked Sendable {
     private let baseURL: URL
     private let apiKey: String
     private let urlSession: URLSession
-
+    
     // Configure with your Supabase project URL and anon key.
+    
+    //    let supabase = SupabaseClient(
+    //      supabaseURL: URL(string: "https://gkhjjokrsiuyqcmpjcmw.supabase.co")!,
+    //      supabaseKey: "sb_publishable_kpJ_2UmkDA8QwugO5JTApQ_2GVu-L-0"
+    //    )
     init(
-        baseURL: URL = URL(string: "https://YOUR-PROJECT-REF.supabase.co/rest/v1")!,
-        apiKey: String = "YOUR_SUPABASE_ANON_KEY",
+        baseURL: URL = URL(string: "https://gkhjjokrsiuyqcmpjcmw.supabase.co.supabase.co/rest/v1")!,
+        apiKey: String = "sb_publishable_kpJ_2UmkDA8QwugO5JTApQ_2GVu-L-0",
         urlSession: URLSession = .shared
     ) {
         self.baseURL = baseURL
         self.apiKey = apiKey
         self.urlSession = urlSession
     }
-
+    
     private func request(path: String, method: String, query: [URLQueryItem] = [], body: Data? = nil, prefer: String? = nil) throws -> URLRequest {
         var components = URLComponents(url: baseURL.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
         if !query.isEmpty {
@@ -67,7 +72,7 @@ final class SupabaseService: SupabaseFavoriting, @unchecked Sendable {
         req.httpBody = body
         return req
     }
-
+    
     func fetchFavorites(for userID: UUID) async throws -> [FavoriteCity] {
         let filter = "user_id=eq.\(userID.uuidString.lowercased())"
         let req = try request(
@@ -85,7 +90,7 @@ final class SupabaseService: SupabaseFavoriting, @unchecked Sendable {
         decoder.dateDecodingStrategy = .iso8601
         return try decoder.decode([FavoriteCity].self, from: data)
     }
-
+    
     func addFavorite(for userID: UUID, city: String) async throws -> FavoriteCity {
         struct Insert: Codable { let user_id: UUID; let city: String }
         let payload = try JSONEncoder().encode([Insert(user_id: userID, city: city)])
@@ -105,7 +110,7 @@ final class SupabaseService: SupabaseFavoriting, @unchecked Sendable {
         }
         return first
     }
-
+    
     func removeFavorite(id: UUID) async throws {
         let req = try request(
             path: "favorites",
@@ -118,7 +123,7 @@ final class SupabaseService: SupabaseFavoriting, @unchecked Sendable {
         let (data, resp) = try await urlSession.data(for: req)
         try SupabaseService.ensureOK(resp: resp, data: data)
     }
-
+    
     private static func ensureOK(resp: URLResponse, data: Data) throws {
         guard let http = resp as? HTTPURLResponse else { return }
         if (200...299).contains(http.statusCode) { return }

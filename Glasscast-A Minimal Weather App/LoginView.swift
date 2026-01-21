@@ -7,7 +7,7 @@
 
 import SwiftUI
 import Combine
-
+ 
 struct LoginView: View {
     
     @State private var email = ""

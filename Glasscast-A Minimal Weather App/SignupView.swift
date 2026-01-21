@@ -8,6 +8,7 @@
 import SwiftUI
 import Combine
 
+
 struct SignupView: View {
     
     @State private var fullName = ""
@@ -15,6 +16,12 @@ struct SignupView: View {
     @State private var password = ""
     @State private var confirmPassword = ""
     @State private var agreeToTerms = false
+
+    // Auth UI state
+    @State private var isSigningUp = false
+    @State private var errorMessage: String?
+    @State private var successMessage: String?
+    @State private var navigateToLogin = false
     
     // Pick the theme for this screen
     private let screenTheme: WeatherTheme = .sunny
@@ -50,6 +57,15 @@ struct SignupView: View {
                 
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 22) {
+                        // Hidden NavigationLink to go back to Login after successful signup
+                        NavigationLink(isActive: $navigateToLogin) {
+                            LoginView()
+                                .navigationBarBackButtonHidden(true)
+                        } label: {
+                            EmptyView()
+                        }
+                        .hidden()
+
                         // Logo / Title
                         VStack(spacing: 10) {
                             Circle()
@@ -184,13 +200,31 @@ struct SignupView: View {
                             .tint(.cyan)
                             .padding(.top, 2)
                             
+                            // Error / Success messages
+                            if let error = errorMessage {
+                                Text(error)
+                                    .font(.footnote)
+                                    .foregroundColor(.red.opacity(0.95))
+                                    .transition(.opacity)
+                            }
+                            if let success = successMessage {
+                                Text(success)
+                                    .font(.footnote.weight(.semibold))
+                                    .foregroundColor(.green.opacity(0.95))
+                                    .transition(.opacity)
+                            }
+                            
                             // Create Account Button
                             Button {
-                                // Handle sign up action
+                                Task { await signUp() }
                             } label: {
                                 HStack {
-                                    Text("Create Account").bold()
-                                    Image(systemName: "person.badge.plus")
+                                    if isSigningUp {
+                                        ProgressView().tint(.white)
+                                    } else {
+                                        Text("Create Account").bold()
+                                        Image(systemName: "person.badge.plus")
+                                    }
                                 }
                                 .foregroundColor(.white)
                                 .frame(maxWidth: .infinity)
@@ -208,8 +242,8 @@ struct SignupView: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 20))
                                 .shadow(color: .cyan.opacity(0.45), radius: 20, y: 8)
                             }
-                            .disabled(!isFormValid)
-                            .opacity(isFormValid ? 1.0 : 0.5)
+                            .disabled(!isFormValid || isSigningUp)
+                            .opacity((isFormValid && !isSigningUp) ? 1.0 : 0.5)
                             
                             // Link back to Sign In
                             HStack(spacing: 6) {
@@ -250,6 +284,46 @@ struct SignupView: View {
             }
         }
         .navigationBarBackButtonHidden(true)
+        // Optional: present success as an alert that routes to Login
+        .alert("Check your email", isPresented: .constant(successMessage != nil)) {
+            Button("OK") {
+                successMessage = nil
+                // After acknowledging, go to Login
+                navigateToLogin = true
+            }
+        } message: {
+            Text(successMessage ?? "")
+        }
+    }
+
+    // MARK: - Supabase Signup
+    @MainActor
+    private func signUp() async {
+        guard isFormValid, !isSigningUp else { return }
+        errorMessage = nil
+        successMessage = nil
+        isSigningUp = true
+        defer { isSigningUp = false }
+
+        do {
+            // Pass full name to user metadata so you can use it later.
+            let metadata: [String: AnyJSON] = ["full_name": .string(fullName)]
+            let response = try await SupabaseManager.shared.client.auth.signUp(
+                email: email,
+                password: password,
+                data: metadata
+            )
+
+            // If email confirmations are enabled, session will be nil and a confirmation email is sent.
+            if response.session == nil {
+                successMessage = "We sent a confirmation link to \(email). Please verify to finish creating your account."
+            } else {
+                // If confirmations are disabled, user is signed in immediately.
+                successMessage = "Account created successfully."
+            }
+        } catch {
+            errorMessage = (error as NSError).localizedDescription
+        }
     }
 }
 
