@@ -7,6 +7,8 @@
 
 import SwiftUI
 import Combine
+import Helpers
+import Supabase
 
 
 struct SignupView: View {

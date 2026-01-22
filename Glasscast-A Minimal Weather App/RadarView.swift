@@ -26,8 +26,8 @@ struct RadarView: View {
     // Reusable location provider
     @StateObject private var locator = LocationProvider()
     
-    // Favorites
-    @StateObject private var favoritesStore = FavoritesStore()
+    // Favorites: use the shared store from the environment (same instance as SearchCityView)
+    @EnvironmentObject private var favoritesStore: FavoritesStore
     @State private var favoriteCoords: [String: CLLocationCoordinate2D] = [:] // city -> coord
     @State private var favoriteGeocodingInFlight: Set<String> = []
     
@@ -91,7 +91,8 @@ struct RadarView: View {
                         
                         // Favorite city markers
                         ForEach(favoritesStore.favorites, id: \.id) { fav in
-                            if let coord = favoriteCoords[fav.city] {
+                            let coord = coordinateForFavorite(fav)
+                            if let coord {
                                 Annotation(fav.city, coordinate: coord) {
                                     VStack(spacing: 8) {
                                         if selectedFavoriteCity == fav.city {
@@ -139,16 +140,16 @@ struct RadarView: View {
                             }
                         }
                     }
-                    // Load favorites and geocode them
+                    // Load favorites and resolve their coordinates (prefer stored lat/lon; fallback to geocoding)
                     .task {
                         if favoritesStore.favorites.isEmpty {
                             await favoritesStore.load()
                         }
-                        await geocodeFavoritesIfNeeded()
+                        await resolveFavoriteCoordinates()
                     }
-                    // Re-geocode when favorites change (e.g., user adds/removes)
+                    // Re-resolve when favorites change (e.g., user adds/removes)
                     .onChange(of: favoritesStore.favorites) { _ in
-                        Task { await geocodeFavoritesIfNeeded() }
+                        Task { await resolveFavoriteCoordinates() }
                     }
                     
                     // Floating current-location glass button
@@ -218,9 +219,22 @@ struct RadarView: View {
             .padding(.top, 16)
         }
         .onAppear {
+            // Start location updates
             locator.requestWhenInUse()
         }
         .navigationBarBackButtonHidden(true)
+    }
+    
+    // Resolve a coordinate for a given favorite city.
+    // Prefers cached geocoded coords, falls back to the favorite’s stored lat/lon.
+    private func coordinateForFavorite(_ fav: FavoriteCity) -> CLLocationCoordinate2D? {
+        if let cached = favoriteCoords[fav.city] {
+            return cached
+        }
+        if let lat = fav.lat, let lon = fav.lon {
+            return CLLocationCoordinate2D(latitude: lat, longitude: lon)
+        }
+        return nil
     }
     
     // Custom glass marker styled for this app
@@ -482,6 +496,19 @@ struct RadarView: View {
         }
     }
     
+    private func resolveFavoriteCoordinates() async {
+        // First fill from stored lat/lon
+        for fav in favoritesStore.favorites {
+            if let lat = fav.lat, let lon = fav.lon {
+                favoriteCoords[fav.city] = CLLocationCoordinate2D(latitude: lat, longitude: lon)
+            }
+        }
+        // Geocode any that still lack coords
+        await geocodeFavoritesIfNeeded()
+        // Optionally center map to include all markers when we first have them
+        await centerIfNeeded()
+    }
+    
     private func geocodeFavoritesIfNeeded() async {
         let cities = favoritesStore.favorites.map { $0.city }
         for city in cities {
@@ -499,8 +526,6 @@ struct RadarView: View {
             }
             favoriteGeocodingInFlight.remove(city)
         }
-        // Optionally center map to include all markers when we first have them
-        await centerIfNeeded()
     }
     
     private func centerIfNeeded() async {
@@ -568,4 +593,5 @@ struct RadarView: View {
 
 #Preview {
     RadarView()
+        .environmentObject(FavoritesStore()) // for preview only; real app should inject AppContainer's shared store
 }

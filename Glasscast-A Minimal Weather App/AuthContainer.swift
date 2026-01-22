@@ -8,9 +8,21 @@
 import SwiftUI
 
 struct AuthContainer: View {
+    // Observe Supabase auth state
+    @StateObject private var auth = SupabaseManager.shared
+
     var body: some View {
         NavigationStack {
-            LoginView()
+            Group {
+                if auth.isAuthenticated {
+                    // Already signed in -> go to main app
+                    TabContainerView()
+                        .navigationBarBackButtonHidden(true)
+                } else {
+                    // Not signed in -> show login
+                    LoginView()
+                }
+            }
         }
     }
 }
@@ -18,4 +30,3 @@ struct AuthContainer: View {
 #Preview {
     AuthContainer()
 }
-

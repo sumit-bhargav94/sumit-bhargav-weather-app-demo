@@ -16,6 +16,12 @@ struct LoginView: View {
     @State private var navigateToHome = false
     @FocusState private var focusedField: Field?
     @State private var showPassword: Bool = false
+    @State private var errorMessage: String? = nil
+    @State private var showErrorAlert: Bool = false
+    
+    // Debug probe output
+    @State private var probeOutput: String? = nil
+    @State private var showProbeAlert: Bool = false
     
     // Pick the theme for this screen
     private let screenTheme: WeatherTheme = .coldSnowy
@@ -38,6 +44,9 @@ struct LoginView: View {
             // Weather-aware background
             WeatherBackground(theme: screenTheme)
                 .ignoresSafeArea()
+                .onTapGesture {
+                    focusedField = nil
+                }
             
             GeometryReader { proxy in
                 let safeTop = proxy.safeAreaInsets.top
@@ -224,6 +233,27 @@ struct LoginView: View {
                             }
                             .font(.footnote)
                             .frame(maxWidth: .infinity)
+                            
+                            #if DEBUG
+                            // Debug: Raw REST probe button
+                            Button {
+                                Task {
+                                    await runProbe()
+                                }
+                            } label: {
+                                HStack(spacing: 8) {
+                                    Image(systemName: "wrench.and.screwdriver.fill")
+                                    Text("Debug Sign-In Probe")
+                                }
+                                .font(.footnote.bold())
+                                .foregroundColor(.white)
+                                .padding(.vertical, 10)
+                                .frame(maxWidth: .infinity)
+                                .background(Color.orange.opacity(0.25))
+                                .clipShape(RoundedRectangle(cornerRadius: 12))
+                            }
+                            .padding(.top, 4)
+                            #endif
                         }
                         .padding(18)
                         .liquidGlass(cornerRadius: 28, intensity: 0.45)
@@ -248,17 +278,125 @@ struct LoginView: View {
             }
         }
         .navigationBarBackButtonHidden(true)
+        .alert("Sign In Failed", isPresented: $showErrorAlert) {
+            Button("OK", role: .cancel) {
+                showErrorAlert = false
+            }
+        } message: {
+            Text(errorMessage ?? "An unknown error occurred. Please try again.")
+        }
+        #if DEBUG
+        .alert("Probe Output", isPresented: $showProbeAlert) {
+            Button("OK", role: .cancel) { showProbeAlert = false }
+        } message: {
+            Text(probeOutput ?? "No output")
+        }
+        #endif
     }
     
     private func attemptSignIn() {
-        guard !isSigningIn, isFormValid else { return }
-        isSigningIn = true
-        Task {
-            // Replace this delay with real auth logic
-            try? await Task.sleep(nanoseconds: 400_000_000)
-            isSigningIn = false
-            navigateToHome = true
+        guard !isSigningIn else { return }
+        // Trim inputs to avoid common mistakes
+        email = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        password = password.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isFormValid else {
+            presentError("Please enter a valid email and password.")
+            return
         }
+        
+        errorMessage = nil
+        showErrorAlert = false
+        isSigningIn = true
+        focusedField = nil
+        
+        Task {
+            do {
+                try await SupabaseManager.shared.signIn(email: email, password: password)
+                // On success, navigate to the main app
+                await MainActor.run {
+                    isSigningIn = false
+                    navigateToHome = true
+                }
+            } catch {
+                // Try fallback path
+                do {
+                    try await SupabaseManager.shared.signInFallback(email: email, password: password)
+                    await MainActor.run {
+                        isSigningIn = false
+                        navigateToHome = true
+                    }
+                } catch {
+                    let friendly = friendlyAuthError(from: error)
+                    await MainActor.run {
+                        isSigningIn = false
+                        presentError(friendly)
+                    }
+                }
+            }
+        }
+    }
+    
+    #if DEBUG
+    private func runProbe() async {
+        let e = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        let p = password.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !e.isEmpty, !p.isEmpty else {
+            probeOutput = "Enter email and password first."
+            showProbeAlert = true
+            return
+        }
+        do {
+            let output = try await SupabaseManager.shared.rawSignInProbe(email: e, password: p)
+            probeOutput = output
+        } catch {
+            let ns = error as NSError
+            probeOutput = "Probe failed: \(ns.localizedDescription)\n(domain=\(ns.domain) code=\(ns.code))"
+        }
+        showProbeAlert = true
+    }
+    #endif
+    
+    // MARK: - Error presentation helpers
+    
+    private func presentError(_ message: String) {
+        errorMessage = message
+        showErrorAlert = true
+    }
+    
+    // Map opaque/technical errors to friendly messages for users.
+    private func friendlyAuthError(from error: Error) -> String {
+        let ns = error as NSError
+        let raw = ns.localizedDescription
+        
+        // Common opaque decoding error from SDK when response is unexpected
+        if raw == "The data couldn’t be read because it is missing." ||
+            raw == "The data couldn’t be read because it isn’t in the correct format." {
+            return "Sign in didn’t complete. Please check your email and password, then try again. If the issue persists, try again later."
+        }
+        
+        // Network offline / connectivity
+        if ns.domain == NSURLErrorDomain {
+            switch ns.code {
+            case NSURLErrorNotConnectedToInternet:
+                return "You appear to be offline. Please check your internet connection."
+            case NSURLErrorTimedOut:
+                return "The request timed out. Please try again."
+            default:
+                break
+            }
+        }
+        
+        // Supabase / auth typical messages we can clarify a bit
+        let lowered = raw.lowercased()
+        if lowered.contains("invalid login") || lowered.contains("invalid email or password") {
+            return "Invalid email or password. Please try again."
+        }
+        if lowered.contains("email not confirmed") || lowered.contains("confirm") {
+            return "Please confirm your email before signing in. Check your inbox for the verification link."
+        }
+        
+        // Fallback to the original message
+        return raw
     }
 }
 

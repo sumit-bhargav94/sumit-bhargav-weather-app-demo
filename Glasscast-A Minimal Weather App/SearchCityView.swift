@@ -10,27 +10,64 @@ import SwiftUI
 
 struct SearchCityView: View {
     @State private var query: String = ""
-    @State private var results: [String] = []
+    @State private var results: [CitySearchResult] = []
+    // Per-result weather cache by result id
+    @State private var weatherCache: [Int: CurrentWeather] = [:]
+    @State private var loadingSet: Set<Int> = []
+    
+    // Favorites per-row weather cache by favorite UUID
+    @State private var favoritesWeather: [UUID: CurrentWeather] = [:]
+    @State private var favoritesLoading: Set<UUID> = []
     
     // Use the shared FavoritesStore provided by the app
     @EnvironmentObject private var favorites: FavoritesStore
+    @Environment(\.container) private var container
     
     // Keep a consistent background with app
     private let theme: WeatherTheme = .foggy
-    
-    // Mock data source for search
-    private let allCities = [
-        "Cupertino", "San Francisco", "New York", "London", "Tokyo",
-        "Paris", "Sydney", "Berlin", "Toronto", "Singapore",
-        "Seoul", "Mumbai", "Cape Town", "São Paulo", "Mexico City"
-    ]
     
     // Debounce task
     @State private var searchTask: Task<Void, Never>?
     // Clear all confirmation
     @State private var showClearAllConfirm = false
-    // Demo seeding control
-    @State private var seededDemo = false
+    
+    // Track focus for the search field
+    @FocusState private var isSearchFocused: Bool
+    
+    // MARK: - WeatherAPI search endpoint model
+    struct CitySearchResult: Identifiable, Equatable {
+        let id: Int
+        let name: String
+        let region: String
+        let country: String
+        let lat: Double
+        let lon: Double
+        let url: String
+    }
+    
+    private struct CitySearchDTO: Decodable {
+        let id: Int
+        let name: String
+        let region: String
+        let country: String
+        let lat: Double
+        let lon: Double
+        let url: String
+    }
+    
+    private enum SearchError: LocalizedError {
+        case badURL
+        case http(Int, String)
+        var errorDescription: String? {
+            switch self {
+            case .badURL: return "Invalid search URL."
+            case .http(let code, let body): return "HTTP \(code): \(body)"
+            }
+        }
+    }
+    
+    // WeatherAPI key (align with your service default)
+    private let apiKey: String = WeatherAPIService.defaultAPIKey
     
     var body: some View {
         ZStack {
@@ -64,16 +101,8 @@ struct SearchCityView: View {
             }
         }
         .task {
-            // Enable mock mode so no backend calls are attempted for now
-            favorites.mockMode = true
+            // Load favorites from the active backend (Supabase when mockMode is false)
             await favorites.load()
-        }
-        .task {
-            // Seed some demo results so you can see full design immediately
-            if !seededDemo && results.isEmpty && query.isEmpty {
-                seededDemo = true
-                results = Array(allCities.prefix(6))
-            }
         }
         .onChange(of: query) { _, newValue in
             debounceSearch(for: newValue)
@@ -92,20 +121,6 @@ struct SearchCityView: View {
     // MARK: - Header Top Bar (Chevron + Title)
     private var topBar: some View {
         HStack(spacing: 12) {
-            Button {
-                // Parent navigation can handle dismiss if needed
-            } label: {
-                Circle()
-                    .fill(.ultraThinMaterial)
-                    .frame(width: 44, height: 44)
-                    .overlay {
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: 20, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.9))
-                    }
-                    .shadow(color: .black.opacity(0.3), radius: 12, y: 6)
-            }
-            .buttonStyle(.plain)
             
             VStack(alignment: .leading, spacing: 2) {
                 Text("Search for a City")
@@ -134,11 +149,16 @@ struct SearchCityView: View {
                 .foregroundColor(.white)
                 .tint(.cyan)
                 .font(.system(.body, design: .rounded))
+                .focused($isSearchFocused)
+                .onSubmit {
+                    Task { await performSearch(query: query) }
+                }
             
             if !query.isEmpty {
                 Button {
                     query = ""
-                    results = Array(allCities.prefix(6))
+                    results = []
+                    weatherCache.removeAll()
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundColor(.white.opacity(0.75))
@@ -149,15 +169,15 @@ struct SearchCityView: View {
         }
         .padding(.vertical, 16)
         .padding(.horizontal, 18)
-        // Use a dedicated, neutral glass style so this matches the original design
+        // Neutral glass style
         .glassSearchFieldStyle(cornerRadius: 22)
         .padding(.horizontal, 16)
     }
     
-    // MARK: - Favorites Section with CLEAR ALL
+    // MARK: - Favorites Section with CLEAR ALL + SYNC
     private var favoritesSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
+            HStack(spacing: 12) {
                 Text("FAVORITES")
                     .font(.caption.weight(.semibold))
                     .foregroundColor(.white.opacity(0.75))
@@ -166,7 +186,24 @@ struct SearchCityView: View {
                 
                 if favorites.isLoading {
                     ProgressView().tint(.cyan)
-                } else if !favorites.favorites.isEmpty {
+                } else {
+                    Button {
+                        Task { await favorites.load() }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.clockwise.circle.fill")
+                            Text("SYNC")
+                        }
+                        .font(.caption.weight(.bold))
+                        .foregroundColor(.cyan)
+                    }
+                    .buttonStyle(.plain)
+                }
+                
+                if !favorites.favorites.isEmpty && !favorites.isLoading {
+                    Divider()
+                        .frame(height: 12)
+                        .overlay(Color.white.opacity(0.25))
                     Button {
                         showClearAllConfirm = true
                     } label: {
@@ -187,7 +224,10 @@ struct SearchCityView: View {
             } else {
                 VStack(spacing: 16) {
                     ForEach(favorites.favorites) { fav in
-                        favoriteRow(city: fav.city, id: fav.id)
+                        favoriteRow(city: fav.city, id: fav.id, country: fav.country)
+                            .task(id: fav.id) {
+                                await fetchFavoriteWeatherIfNeeded(fav)
+                            }
                     }
                 }
                 .padding(.horizontal, 16)
@@ -195,9 +235,21 @@ struct SearchCityView: View {
         }
     }
     
-    private func favoriteRow(city: String, id: UUID) -> some View {
+    private func favoriteRow(city: String, id: UUID, country: String) -> some View {
         let mood = moodForCity(city).title
         let icon = moodForCity(city).icon
+        let cw = favoritesWeather[id]
+        
+        let tempText: String = {
+            if let cw {
+                let t = TemperatureUnit.convert(cw.temperature)
+                return "\(t)°"
+            } else if favoritesLoading.contains(id) {
+                return "…"
+            } else {
+                return "—°"
+            }
+        }()
         
         return HStack(spacing: 16) {
             ZStack {
@@ -226,16 +278,16 @@ struct SearchCityView: View {
             Spacer(minLength: 12)
             
             VStack(alignment: .trailing, spacing: 2) {
-                Text("—°")
+                Text(tempText)
                     .font(.system(size: 20, weight: .bold, design: .rounded))
                     .foregroundColor(.white)
-                Text("Celsius")
+                Text(TemperatureUnit.unitLabel)
                     .font(.caption2)
                     .foregroundColor(.white.opacity(0.6))
             }
             
             Button {
-                Task { await favorites.toggle(city: city) }
+                Task { await favorites.toggle(city: city, country: country) }
             } label: {
                 Image(systemName: "trash.fill")
                     .foregroundColor(.red.opacity(0.9))
@@ -247,44 +299,63 @@ struct SearchCityView: View {
         .padding(.vertical, 12)
         .padding(.horizontal, 20)
         .glassCardTinted(cornerRadius: 24, city: city)
-        // No onTapGesture here; only the button should toggle
     }
     
-    // MARK: - Results Section (My Location removed)
+    // MARK: - Results Section (real API search)
     private var resultsSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("RECENT EXPLORATIONS")
-                    .font(.caption.weight(.semibold))
-                    .foregroundColor(.white.opacity(0.75))
-                Spacer()
-            }
-            .padding(.horizontal, 16)
-            
-            VStack(spacing: 16) {
-                if query.isEmpty && results.isEmpty {
-                    Text("Start typing to search cities or add from your favorites above.")
-                        .font(.footnote)
-                        .foregroundColor(.white.opacity(0.65))
-                        .padding(.horizontal, 16)
-                } else if !results.isEmpty {
-                    ForEach(results, id: \.self) { city in
-                        resultRow(city: city)
-                            .padding(.horizontal, 16)
+        // Only show the Results section while user is actively searching:
+        // - search field focused
+        // - query non-empty
+        Group {
+            if isSearchFocused && !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Text("SEARCH RESULTS")
+                            .font(.caption.weight(.semibold))
+                            .foregroundColor(.white.opacity(0.75))
+                        Spacer()
                     }
-                } else if !query.isEmpty && results.isEmpty {
-                    Text("No results for “\(query)”")
-                        .foregroundColor(.white.opacity(0.7))
-                        .padding(.horizontal, 16)
+                    .padding(.horizontal, 16)
+                    
+                    VStack(spacing: 16) {
+                        if !results.isEmpty {
+                            ForEach(results) { city in
+                                resultRow(city: city)
+                                    .padding(.horizontal, 16)
+                                    .task(id: city.id) {
+                                        await fetchWeatherForResultIfNeeded(city)
+                                    }
+                            }
+                        } else {
+                            // While typing with focus but no results yet, we can either show nothing
+                            // or a subtle hint. Requirement says to hide the previous prompt, so show nothing.
+                            EmptyView()
+                        }
+                    }
                 }
+            } else {
+                // When not focused or query empty, hide the whole section (including header and hint).
+                EmptyView()
             }
         }
     }
     
-    private func resultRow(city: String) -> some View {
-        let mood = moodForCity(city).title
-        let icon = moodForCity(city).icon
-        let isFav = favorites.isFavorite(city) != nil
+    private func resultRow(city: CitySearchResult) -> some View {
+        let mood = moodForCity(city.name).title
+        let icon = moodForCity(city.name).icon
+        let isFav = favorites.isFavorite(city.name) != nil
+        let cw = weatherCache[city.id]
+        
+        let tempText: String = {
+            if let cw {
+                let t = TemperatureUnit.convert(cw.temperature)
+                return "\(t)°"
+            } else if loadingSet.contains(city.id) {
+                return "…"
+            } else {
+                return "—°"
+            }
+        }()
         
         return HStack(spacing: 16) {
             ZStack {
@@ -297,10 +368,10 @@ struct SearchCityView: View {
             .frame(width: 46, height: 46)
             
             VStack(alignment: .leading, spacing: 6) {
-                Text(city)
+                Text(city.name)
                     .foregroundColor(.white)
                     .font(.system(.headline, design: .rounded).weight(.bold))
-                Text(mood)
+                Text("\(city.region.isEmpty ? city.country : "\(city.region), \(city.country)")")
                     .font(.system(.caption, design: .rounded))
                     .foregroundColor(.white.opacity(0.75))
             }
@@ -308,16 +379,18 @@ struct SearchCityView: View {
             Spacer(minLength: 12)
             
             VStack(alignment: .trailing, spacing: 2) {
-                Text("—°")
+                Text(tempText)
                     .font(.system(size: 20, weight: .bold, design: .rounded))
                     .foregroundColor(.white)
-                Text("Celsius")
+                Text(TemperatureUnit.unitLabel)
                     .font(.caption2)
                     .foregroundColor(.white.opacity(0.6))
             }
             
             Button {
-                Task { await favorites.toggle(city: city) }
+                Task {
+                    await favorites.toggle(city: city.name, country: city.country, lat: city.lat, lon: city.lon)
+                }
             } label: {
                 Image(systemName: isFav ? "star.fill" : "star")
                     .foregroundColor(.yellow)
@@ -328,27 +401,124 @@ struct SearchCityView: View {
         .frame(minHeight: 68)
         .padding(.vertical, 12)
         .padding(.horizontal, 20)
-        .glassCardTinted(cornerRadius: 26, city: city)
-        // No onTapGesture here; only the star button should toggle
+        .glassCardTinted(cornerRadius: 26, city: city.name)
     }
     
-    // MARK: - Debounced search using Swift Concurrency
+    // MARK: - Debounced search using WeatherAPI
     private func debounceSearch(for text: String) {
         searchTask?.cancel()
-        searchTask = Task { [allCities] in
-            try? await Task.sleep(nanoseconds: 250_000_000)
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            results = []
+            weatherCache.removeAll()
+            loadingSet.removeAll()
+            return
+        }
+        searchTask = Task { [text] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
             guard !Task.isCancelled else { return }
-            await MainActor.run {
-                if text.isEmpty {
-                    self.results = Array(allCities.prefix(6))
-                } else {
-                    self.results = allCities.filter { $0.localizedCaseInsensitiveContains(text) }
-                }
-            }
+            await performSearch(query: text)
         }
     }
     
-    // MARK: - Mood/Icon mapping (placeholder)
+    @MainActor
+    private func performSearch(query: String) async {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            results = []
+            weatherCache.removeAll()
+            loadingSet.removeAll()
+            return
+        }
+        do {
+            let found = try await searchCities(query: trimmed)
+            results = found
+            // Optionally prefetch first few results’ weather
+            let prefetch = Array(found.prefix(6))
+            for city in prefetch {
+                Task { await fetchWeatherForResultIfNeeded(city) }
+            }
+        } catch {
+#if DEBUG
+            print("[SearchCity] search failed: \(error.localizedDescription)")
+#endif
+            results = []
+            weatherCache.removeAll()
+            loadingSet.removeAll()
+        }
+    }
+    
+    private func searchCities(query: String) async throws -> [CitySearchResult] {
+        var comps = URLComponents(string: "https://api.weatherapi.com/v1/search.json")!
+        comps.queryItems = [
+            URLQueryItem(name: "q", value: query),
+            URLQueryItem(name: "key", value: apiKey)
+        ]
+        guard let url = comps.url else { throw SearchError.badURL }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        if let http = resp as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            let body = String(data: data, encoding: .utf8) ?? "<non-UTF8 body>"
+            throw SearchError.http(http.statusCode, body)
+        }
+        
+        let decoded = try JSONDecoder().decode([CitySearchDTO].self, from: data)
+        return decoded.map {
+            CitySearchResult(id: $0.id, name: $0.name, region: $0.region, country: $0.country, lat: $0.lat, lon: $0.lon, url: $0.url)
+        }
+    }
+    
+    // MARK: - Weather fetch per search result
+    
+    private func fetchWeatherForResultIfNeeded(_ city: CitySearchResult) async {
+        guard weatherCache[city.id] == nil, !loadingSet.contains(city.id) else { return }
+        loadingSet.insert(city.id)
+        defer { loadingSet.remove(city.id) }
+        do {
+            // Use shared WeatherService from container; query via "lat,lon" to be precise.
+            let svc = container.weatherService
+            let query = "\(city.lat),\(city.lon)"
+            let current = try await svc.fetchCurrentWeather(for: query)
+            await MainActor.run {
+                weatherCache[city.id] = current
+            }
+        } catch {
+            // Swallow per-row errors; row will keep placeholder
+#if DEBUG
+            print("[SearchCity] weather fetch failed for \(city.name): \(error.localizedDescription)")
+#endif
+        }
+    }
+    
+    // MARK: - Weather fetch per favorite
+    
+    private func fetchFavoriteWeatherIfNeeded(_ fav: FavoriteCity) async {
+        guard favoritesWeather[fav.id] == nil, !favoritesLoading.contains(fav.id) else { return }
+        favoritesLoading.insert(fav.id)
+        defer { favoritesLoading.remove(fav.id) }
+        do {
+            let svc = container.weatherService
+            let query: String
+            if let lat = fav.lat, let lon = fav.lon {
+                query = "\(lat),\(lon)"
+            } else {
+                // Fallback to city string if no coordinates stored
+                query = fav.city
+            }
+            let current = try await svc.fetchCurrentWeather(for: query)
+            await MainActor.run {
+                favoritesWeather[fav.id] = current
+            }
+        } catch {
+#if DEBUG
+            print("[SearchCity] favorite weather fetch failed for \(fav.city): \(error.localizedDescription)")
+#endif
+        }
+    }
+    
+    // MARK: - Mood/Icon mapping (placeholder for row visuals)
     private func moodForCity(_ city: String) -> (title: String, icon: String) {
         let moods: [(String, String)] = [
             ("Sunny Skies", "sun.max.fill"),
@@ -363,187 +533,12 @@ struct SearchCityView: View {
         let idx = abs(city.hashValue) % moods.count
         return moods[idx]
     }
-    
-    // MARK: - Day/Night demo logic
-    private func isDaytime(for city: String) -> Bool {
-        // Demo-only: stable pseudo-random day/night by hash
-        // Replace with real sunrise/sunset checks for the city’s coordinates.
-        (abs(city.hashValue) % 2) == 0
-    }
-    
-    private func isSunny(for city: String) -> Bool {
-        let mood = moodForCity(city).title
-        return mood.contains("Sunny")
-    }
-}
-
-// MARK: - Blur + Stroke + Liquid + Day/Night tint helper
-private extension View {
-    func glassCardTinted(cornerRadius: CGFloat, city: String) -> some View {
-        modifier(GlassCardTinted(cornerRadius: cornerRadius, city: city))
-    }
-    
-    // Neutral glass style specifically for the search field, matching the earlier look
-    func glassSearchFieldStyle(cornerRadius: CGFloat) -> some View {
-        modifier(GlassSearchFieldStyle(cornerRadius: cornerRadius))
-    }
-}
-
-private struct GlassCardTinted: ViewModifier {
-    var cornerRadius: CGFloat
-    var city: String
-    
-    func body(content: Content) -> some View {
-        content
-            .background(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .fill(weatherGradient(for: city))
-                    .allowsHitTesting(false)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .fill(.ultraThinMaterial.opacity(0.35))
-                    .allowsHitTesting(false)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .fill(specularHighlight(for: city))
-                    .allowsHitTesting(false)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(
-                        LinearGradient(
-                            colors: [
-                                .white.opacity(0.28),
-                                .white.opacity(0.12)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        ),
-                        lineWidth: 1
-                    )
-                    .allowsHitTesting(false)
-            )
-            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            // Move shadow to a separate, non-interactive overlay to avoid hit-test work
-            .overlay(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .fill(Color.clear)
-                    .shadow(color: .black.opacity(0.25), radius: 18, y: 10)
-                    .allowsHitTesting(false)
-            )
-            .liquidGlass(cornerRadius: cornerRadius, intensity: 0.22)
-    }
-    
-    private func weatherGradient(for city: String) -> LinearGradient {
-        let day = isDaytime(city)
-        let sunny = isSunny(city)
-        
-        let colors: [Color]
-        if day && sunny {
-            colors = [
-                Color(red: 0.35, green: 0.72, blue: 1.00),
-                Color(red: 0.14, green: 0.52, blue: 0.96)
-            ]
-        } else if day {
-            colors = [
-                Color(red: 0.44, green: 0.60, blue: 0.82),
-                Color(red: 0.26, green: 0.39, blue: 0.60)
-            ]
-        } else if sunny {
-            colors = [
-                Color(red: 0.20, green: 0.26, blue: 0.42),
-                Color(red: 0.09, green: 0.12, blue: 0.24)
-            ]
-        } else {
-            colors = [
-                Color(red: 0.10, green: 0.12, blue: 0.20),
-                Color(red: 0.04, green: 0.05, blue: 0.12)
-            ]
-        }
-        
-        return LinearGradient(
-            colors: colors,
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
-    }
-    
-    private func specularHighlight(for city: String) -> LinearGradient {
-        let day = isDaytime(city)
-        let topOpacity = day ? 0.28 : 0.20
-        
-        return LinearGradient(
-            colors: [
-                Color.white.opacity(topOpacity),
-                Color.white.opacity(0.06),
-                .clear
-            ],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
-    }
-    
-    private func isDaytime(_ city: String) -> Bool {
-        (abs(city.hashValue) % 2) == 0
-    }
-    private func isSunny(_ city: String) -> Bool {
-        let moods: [(String, String)] = [
-            ("Sunny Skies", "sun.max.fill"),
-            ("Partly Cloudy", "cloud.sun.fill"),
-            ("Light Showers", "cloud.drizzle.fill"),
-            ("Rain", "cloud.rain.fill"),
-            ("Stormy", "cloud.bolt.rain.fill"),
-            ("Fog", "cloud.fog.fill"),
-            ("Windy", "wind"),
-            ("Snow", "snow")
-        ]
-        let idx = abs(city.hashValue) % moods.count
-        return moods[idx].0.contains("Sunny")
-    }
-}
-
-// MARK: - Original-style neutral glass for the search field
-private struct GlassSearchFieldStyle: ViewModifier {
-    var cornerRadius: CGFloat
-    
-    func body(content: Content) -> some View {
-        content
-            .background(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .fill(.ultraThinMaterial)
-                    .allowsHitTesting(false)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(
-                        LinearGradient(
-                            colors: [
-                                .white.opacity(0.30),
-                                .white.opacity(0.10)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        ),
-                        lineWidth: 1
-                    )
-                    .allowsHitTesting(false)
-            )
-            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .fill(Color.clear)
-                    .shadow(color: .black.opacity(0.22), radius: 16, y: 8)
-                    .allowsHitTesting(false)
-            )
-            .liquidGlass(cornerRadius: cornerRadius, intensity: 0.20)
-    }
 }
 
 #Preview {
     NavigationStack {
         SearchCityView()
             .environmentObject(FavoritesStore())
+            .environment(\.container, AppContainer())
     }
 }

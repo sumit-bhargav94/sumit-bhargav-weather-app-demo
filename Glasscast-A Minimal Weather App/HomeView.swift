@@ -7,26 +7,34 @@
 
 import Foundation
 import SwiftUI
-
+import CoreLocation
 
 struct HomeView: View {
+    @Environment(\.container) private var container
+
     @StateObject private var model: HomeViewModel
+    @StateObject private var locator = LocationProvider()
+    private let geocoder = CLGeocoder()
     
-    // Keep wind/pressure here; temperature unit now comes from TemperatureUnit.
+    // Units
     @AppStorage("windUnitIsKmh") private var windUnitIsKmh: Bool = true
     @AppStorage("pressureUnitIsHpa") private var pressureUnitIsHpa: Bool = true
-    // Read notification prefs set in SettingsView
+    @AppStorage("useCelsius") private var useCelsius: Bool = true
+    // Notifications
     @AppStorage("notificationsSevereAlerts") private var severeAlerts: Bool = true
     @AppStorage("notificationsDailySummary") private var dailySummary: Bool = false
     
-    // If no data yet, pick a pleasant default theme for background
+    // Background theme
     private var theme: WeatherTheme {
         model.current?.theme ?? .sunny
     }
     
     init() {
-        // Initialize once; HomeViewModel defaults to MockWeatherService
         _model = StateObject(wrappedValue: HomeViewModel())
+    }
+    
+    init(model: HomeViewModel) {
+        _model = StateObject(wrappedValue: model)
     }
     
     var body: some View {
@@ -42,15 +50,14 @@ struct HomeView: View {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 18) {
                         header
-                        // Notifications banner reflects SettingsView toggles
                         notificationsBanner
                         currentCard
                         forecastStrip
                         sunriseSunsetCard
                         todayHighlightsGrid
+                        airQualityCardIfAvailable
                         precipitationCard
                         
-                        // Standardized error message rendering
                         if case let .failed(message) = model.loadingState {
                             Text(message)
                                 .font(.footnote)
@@ -62,14 +69,13 @@ struct HomeView: View {
                     }
                     .padding(.top, contentTopPadding)
                     .padding(.bottom, max(24, safeBottom + 8))
-                    .frame(maxWidth: 700) // keeps it elegant on larger devices
+                    .frame(maxWidth: 700)
                 }
                 .refreshable {
                     await model.refresh()
                 }
             }
             
-            // Optional overlay spinner for .loading
             if case .loading = model.loadingState {
                 ProgressView()
                     .tint(.cyan)
@@ -79,7 +85,32 @@ struct HomeView: View {
         .task {
             await model.load()
         }
+        .onAppear {
+            locator.requestWhenInUse()
+        }
+        .task(id: locator.coordinate?.latitude) {
+            guard let coord = locator.coordinate else { return }
+            await updateCityFromCoordinate(coord)
+        }
         .navigationBarBackButtonHidden(true)
+    }
+    
+    private func updateCityFromCoordinate(_ coord: CLLocationCoordinate2D) async {
+        do {
+            let placemarks = try await geocoder.reverseGeocodeLocation(
+                CLLocation(latitude: coord.latitude, longitude: coord.longitude)
+            )
+            let city = placemarks.first?.locality ?? placemarks.first?.name ?? "Current Location"
+            let old = model.city
+            await MainActor.run { model.city = city }
+            if old.caseInsensitiveCompare(city) != .orderedSame {
+                await model.refresh()
+            }
+        } catch {
+            #if DEBUG
+            print("[HomeView] reverseGeocode failed: \(error.localizedDescription)")
+            #endif
+        }
     }
     
     private var header: some View {
@@ -110,7 +141,6 @@ struct HomeView: View {
         }
     }
     
-    // Reflect notifications preferences from SettingsView
     private var notificationsBanner: some View {
         Group {
             if severeAlerts || dailySummary {
@@ -193,7 +223,8 @@ struct HomeView: View {
             }
             
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                let temp = TemperatureUnit.convert(model.current?.temperature ?? 0)
+                let tempF = Double(model.current?.temperature ?? 0)
+                let temp = useCelsius ? Int(round((tempF - 32) * 5 / 9)) : Int(round(tempF))
                 Text("\(temp)")
                     .font(.system(size: 64, weight: .bold, design: .rounded))
                     .foregroundColor(.white)
@@ -271,7 +302,6 @@ struct HomeView: View {
         }
     }
     
-    // Sunrise / Sunset card with simple progress
     private var sunriseSunsetCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
@@ -285,13 +315,13 @@ struct HomeView: View {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 8) {
                         Image(systemName: "sunrise.fill").foregroundColor(.yellow)
-                        Text(demoSunriseString)
+                        Text(model.current?.sunrise ?? "--:--")
                             .foregroundColor(.white)
                             .font(.headline.bold())
                     }
                     HStack(spacing: 8) {
                         Image(systemName: "sunset.fill").foregroundColor(.orange)
-                        Text(demoSunsetString)
+                        Text(model.current?.sunset ?? "--:--")
                             .foregroundColor(.white)
                             .font(.headline.bold())
                     }
@@ -299,7 +329,7 @@ struct HomeView: View {
                 
                 Spacer()
                 
-                SunriseArc(progress: demoSunProgress)
+                SunriseArc(progress: 0.55) // Optionally compute from localtime vs sunrise/sunset in future
                     .frame(width: 96, height: 56)
             }
         }
@@ -308,7 +338,6 @@ struct HomeView: View {
         .padding(.horizontal, 16)
     }
     
-    // Today Highlights grid
     private var todayHighlightsGrid: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Today’s Highlights")
@@ -319,30 +348,89 @@ struct HomeView: View {
             let columns = [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)]
             
             LazyVGrid(columns: columns, spacing: 12) {
-                highlightTile(icon: "thermometer.sun.fill",
-                              title: "Feels Like",
-                              value: "\(TemperatureUnit.convert(demoFeelsLike))°\(TemperatureUnit.unitLabel)")
-                highlightTile(icon: "wind",
-                              title: "Wind",
-                              value: formattedWind(demoWind))
-                highlightTile(icon: "humidity.fill",
-                              title: "Humidity",
-                              value: "\(demoHumidity)%")
-                highlightTile(icon: "gauge.with.dots.needle.bottom.50percent",
-                              title: "Pressure",
-                              value: formattedPressure(demoPressure))
-                highlightTile(icon: "eye.fill",
-                              title: "Visibility",
-                              value: formattedVisibility(demoVisibility))
-                highlightTile(icon: "sun.max.trianglebadge.exclamationmark",
-                              title: "UV Index",
-                              value: "\(demoUV)")
+                if let feels = model.current?.feelsLikeF {
+                    let feelsDisplay = TemperatureUnit.convert(Int(round(feels)))
+                    highlightTile(icon: "thermometer.sun.fill",
+                                  title: "Feels Like",
+                                  value: "\(feelsDisplay)°\(TemperatureUnit.unitLabel)")
+                }
+                if let wind = model.current?.windKph {
+                    highlightTile(icon: "wind",
+                                  title: "Wind",
+                                  value: formattedWind(wind))
+                }
+                if let hum = model.current?.humidity {
+                    highlightTile(icon: "humidity.fill",
+                                  title: "Humidity",
+                                  value: "\(hum)%")
+                }
+                if let p = model.current?.pressureMb {
+                    highlightTile(icon: "gauge.with.dots.needle.bottom.50percent",
+                                  title: "Pressure",
+                                  value: formattedPressure(p))
+                }
+                if let vis = model.current?.visibilityKm {
+                    highlightTile(icon: "eye.fill",
+                                  title: "Visibility",
+                                  value: formattedVisibility(vis))
+                }
+                if let uv = model.current?.uvIndex {
+                    highlightTile(icon: "sun.max.trianglebadge.exclamationmark",
+                                  title: "UV Index",
+                                  value: "\(Int(round(uv)))")
+                }
+                if let gust = model.current?.gustKph {
+                    highlightTile(icon: "tornado",
+                                  title: "Wind Gust",
+                                  value: formattedWind(gust))
+                }
+                if let dir = model.current?.windDirection, let deg = model.current?.windDegrees {
+                    highlightTile(icon: "location.north.line",
+                                  title: "Wind Dir",
+                                  value: "\(dir) (\(deg)°)")
+                }
+                if let dp = model.current?.dewpointF {
+                    let dpDisplay = TemperatureUnit.convert(Int(round(dp)))
+                    highlightTile(icon: "drop.fill",
+                                  title: "Dew Point",
+                                  value: "\(dpDisplay)°\(TemperatureUnit.unitLabel)")
+                }
+                if let hi = model.current?.heatIndexF {
+                    let hiDisplay = TemperatureUnit.convert(Int(round(hi)))
+                    highlightTile(icon: "thermometer.high",
+                                  title: "Heat Index",
+                                  value: "\(hiDisplay)°\(TemperatureUnit.unitLabel)")
+                }
             }
             .padding(.horizontal, 16)
         }
     }
     
-    // Small precipitation card
+    private var airQualityCardIfAvailable: some View {
+        Group {
+            if let epa = model.current?.aqiEPA, let defra = model.current?.aqiDEFRA {
+                HStack(spacing: 14) {
+                    Image(systemName: "aqi.medium")
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundStyle(.white)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Air Quality")
+                            .font(.subheadline.bold())
+                            .foregroundColor(.white)
+                        Text("EPA \(epa)  •  DEFRA \(defra)")
+                            .font(.caption)
+                            .foregroundColor(.white.opacity(0.7))
+                    }
+                    Spacer()
+                }
+                .padding(.vertical, 14)
+                .padding(.horizontal, 16)
+                .liquidGlass(cornerRadius: 18, intensity: 0.30)
+                .padding(.horizontal, 16)
+            }
+        }
+    }
+    
     private var precipitationCard: some View {
         HStack(spacing: 14) {
             Image(systemName: "cloud.rain.fill")
@@ -357,7 +445,7 @@ struct HomeView: View {
                     .foregroundColor(.white.opacity(0.7))
             }
             Spacer()
-            Text("\(demoPrecipChance)%")
+            Text("\(model.current?.precipChance ?? 0)%")
                 .font(.headline.bold())
                 .foregroundColor(.white)
         }
@@ -367,7 +455,7 @@ struct HomeView: View {
         .padding(.horizontal, 16)
     }
     
-    // MARK: - Helpers: tiles and formatting
+    // MARK: - Helpers
     
     private func highlightTile(icon: String, title: String, value: String) -> some View {
         HStack(spacing: 12) {
@@ -395,11 +483,11 @@ struct HomeView: View {
         .liquidGlass(cornerRadius: 16, intensity: 0.30)
     }
     
-    private func formattedWind(_ speedKmh: Double) -> String {
+    private func formattedWind(_ speedKph: Double) -> String {
         if windUnitIsKmh {
-            return String(format: "%.0f km/h", speedKmh)
+            return String(format: "%.0f km/h", speedKph)
         } else {
-            let mph = speedKmh * 0.621371
+            let mph = speedKph * 0.621371
             return String(format: "%.0f mph", mph)
         }
     }
@@ -408,7 +496,6 @@ struct HomeView: View {
         if pressureUnitIsHpa {
             return String(format: "%.0f hPa", hPa)
         } else {
-            // 1 inHg ≈ 33.8639 hPa
             let inHg = hPa / 33.8639
             return String(format: "%.2f inHg", inHg)
         }
@@ -421,68 +508,6 @@ struct HomeView: View {
             let miles = km * 0.621371
             return String(format: "%.1f mi", miles)
         }
-    }
-    
-    // MARK: - Demo/Placeholder metrics (replace with real model fields later)
-    private var lastUpdatedString: String {
-        // In real data, bind to a timestamp from the model
-        let df = DateFormatter()
-        df.dateFormat = "h:mm a"
-        return df.string(from: Date())
-    }
-    private var demoFeelsLike: Int {
-        // Approximation using current +/- small delta
-        let base = model.current?.temperature ?? 68
-        return max(0, base + Int.random(in: -2...2))
-    }
-    private var demoWind: Double {
-        // km/h
-        switch theme {
-        case .windy: return 28
-        case .stormy: return 32
-        default: return 14
-        }
-    }
-    private var demoHumidity: Int {
-        switch theme {
-        case .hotHumid: return 78
-        case .rainy, .foggy: return 82
-        default: return 55
-        }
-    }
-    private var demoPressure: Double {
-        switch theme {
-        case .stormy, .rainy: return 1006
-        default: return 1016
-        }
-    }
-    private var demoVisibility: Double {
-        switch theme {
-        case .foggy: return 3.2
-        default: return 10.0
-        }
-    }
-    private var demoUV: Int {
-        switch theme {
-        case .sunny, .hotHumid: return 7
-        default: return 3
-        }
-    }
-    private var demoPrecipChance: Int {
-        switch theme {
-        case .rainy, .stormy: return 80
-        default: return 10
-        }
-    }
-    private var demoSunriseString: String {
-        "6:42 AM"
-    }
-    private var demoSunsetString: String {
-        "7:58 PM"
-    }
-    private var demoSunProgress: Double {
-        // 0...1 across the day; demo value
-        0.55
     }
 }
 
@@ -497,18 +522,15 @@ private struct SunriseArc: View {
             let radius = min(w, h) * 0.9
             
             ZStack {
-                // Base arc
                 Arc(startAngle: .degrees(180), endAngle: .degrees(0))
                     .stroke(.white.opacity(0.25), style: StrokeStyle(lineWidth: 6, lineCap: .round))
                     .frame(width: radius, height: radius/1.6)
                 
-                // Progress arc
                 Arc(startAngle: .degrees(180), endAngle: .degrees(180 + 180 * progress))
                     .stroke(LinearGradient(colors: [.yellow, .orange], startPoint: .leading, endPoint: .trailing),
                             style: StrokeStyle(lineWidth: 6, lineCap: .round))
                     .frame(width: radius, height: radius/1.6)
                 
-                // Sun knob
                 let angle = Angle.degrees(180 + 180 * progress)
                 let r = radius/2.0
                 let cx = w/2

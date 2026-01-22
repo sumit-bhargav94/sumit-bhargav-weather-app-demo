@@ -19,16 +19,20 @@ final class AppContainer: ObservableObject {
     let weatherService: WeatherService
     let favoritingService: SupabaseFavoriting
 
+    private var authObserverTask: Task<Void, Never>?
+
     init(
         session: AppSession? = nil,
         favoritesStore: FavoritesStore? = nil,
         weatherService: WeatherService? = nil,
         favoritingService: SupabaseFavoriting? = nil
     ) {
-        // Construct defaults inside the @MainActor initializer body
         let resolvedSession = session ?? AppSession()
         let resolvedFavoritingService = favoritingService ?? SupabaseService()
-        let resolvedWeatherService = weatherService ?? MockWeatherService()
+        // Inject real WeatherAPI service by default. Replace key with your real key or load from config.
+        let defaultWeather = WeatherAPIService(apiKey: WeatherAPIService.defaultAPIKey)
+        
+        let resolvedWeatherService = weatherService ?? defaultWeather
         let resolvedFavoritesStore = favoritesStore ?? FavoritesStore(service: resolvedFavoritingService, session: resolvedSession)
 
         self.session = resolvedSession
@@ -36,8 +40,35 @@ final class AppContainer: ObservableObject {
         self.weatherService = resolvedWeatherService
         self.favoritingService = resolvedFavoritingService
 
-        // Wire the favorites store to use the same session and service if needed
-        self.favoritesStore.mockMode = true // keep mock by default
+        // Start in mock until we know auth state
+        self.favoritesStore.mockMode = true
+
+        // Observe Supabase auth changes and reflect into AppSession + FavoritesStore
+        authObserverTask = Task { [weak self] in
+            guard let self else { return }
+            let mgr = SupabaseManager.shared
+            for await _ in mgr.$isAuthenticated.values {
+                let authed = mgr.isAuthenticated
+                let userID = mgr.currentUserID
+                // Update AppSession user id if available
+                if let uid = userID {
+                    self.session.currentUserID = uid
+                }
+                // Toggle mock mode
+                self.favoritesStore.mockMode = !authed
+                // Reload favorites when we become authenticated
+                if authed {
+                    await self.favoritesStore.load()
+                } else {
+                    // Clear favorites on sign-out via store API
+                    await self.favoritesStore.clearAll()
+                }
+            }
+        }
+    }
+
+    deinit {
+        authObserverTask?.cancel()
     }
 
     // ViewModel factories
@@ -57,3 +88,4 @@ extension EnvironmentValues {
         set { self[AppContainerKey.self] = newValue }
     }
 }
+

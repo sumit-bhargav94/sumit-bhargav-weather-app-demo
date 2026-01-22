@@ -18,6 +18,26 @@ struct CurrentWeather: Equatable, Sendable {
     let low: Int
     let symbolName: String
     let theme: WeatherTheme
+
+    // Enriched fields from WeatherAPI current + today forecast
+    let feelsLikeF: Double
+    let windKph: Double
+    let humidity: Int
+    let pressureMb: Double
+    let visibilityKm: Double
+    let uvIndex: Double
+    let gustKph: Double
+    let windDirection: String
+    let windDegrees: Int
+    let dewpointF: Double
+    let heatIndexF: Double
+    let aqiEPA: Int?
+    let aqiDEFRA: Int?
+    let pm25: Double?
+    let pm10: Double?
+    let sunrise: String
+    let sunset: String
+    let precipChance: Int
 }
 
 struct ForecastDay: Identifiable, Equatable, Sendable {
@@ -49,6 +69,9 @@ final class HomeViewModel: ObservableObject {
     private let service: WeatherService
     private var refreshTaskID = UUID()
 
+    // Simple toggle to silence logs if desired
+    private let loggingEnabled = true
+
     // Expose a safe, read-only way to tell if this model is using the default/mock service.
     // This avoids leaking the service instance while allowing the view to decide whether to swap in the injected one.
     var isUsingDefaultService: Bool {
@@ -57,40 +80,87 @@ final class HomeViewModel: ObservableObject {
 
     init(service: WeatherService = MockWeatherService()) {
         self.service = service
+        if loggingEnabled {
+            print("[HomeVM] init(service: \(type(of: service)))")
+        }
     }
 
     func load() async {
+        if loggingEnabled {
+            print("[HomeVM] load() begin for city=\(city)")
+        }
         await refresh()
+        if loggingEnabled {
+            print("[HomeVM] load() end")
+        }
     }
 
     func refresh() async {
-        // Coalesce multiple refresh triggers: only latest task should win.
         let taskID = UUID()
         refreshTaskID = taskID
 
         // If a refresh is already running, ignore new ones until finished.
-        guard !isLoading else { return }
+        guard !isLoading else {
+            if loggingEnabled {
+                print("[HomeVM] refresh() ignored; already loading")
+            }
+            return
+        }
 
+        if loggingEnabled {
+            print("[HomeVM] refresh() begin id=\(taskID) city=\(city)")
+        }
         setLoading(true)
 
         do {
+            let start = Date()
+            if loggingEnabled {
+                print("[HomeVM] -> fetching current + 5-day forecast (real)")
+            }
+
             async let c = service.fetchCurrentWeather(for: city)
             async let f = service.fetch5DayForecast(for: city)
             let (current, forecast) = try await (c, f)
 
+            let elapsed = Date().timeIntervalSince(start)
+            if loggingEnabled {
+                print("[HomeVM] <- fetched in \(String(format: "%.2f", elapsed))s")
+                print("[HomeVM] current: city=\(current.city) temp=\(current.temperature)F cond=\(current.condition) hi=\(current.high) lo=\(current.low) symbol=\(current.symbolName) uv=\(current.uvIndex)")
+                let summary = forecast.map { "\($0.weekday): H\($0.high)L\($0.low)" }.joined(separator: ", ")
+                print("[HomeVM] forecast(5): \(summary)")
+            }
+
             // Only apply results if this is still the latest refresh
-            guard taskID == refreshTaskID else { return }
+            guard taskID == refreshTaskID else {
+                if loggingEnabled {
+                    print("[HomeVM] refresh() discard results; newer task exists id=\(refreshTaskID)")
+                }
+                return
+            }
             self.current = current
             self.forecast = forecast
 
             setLoaded()
+            if loggingEnabled {
+                print("[HomeVM] refresh() success id=\(taskID)")
+            }
         } catch is CancellationError {
-            // Benign: ignore cancellations from SwiftUI/refresh control lifecycle
             setIdle()
+            if loggingEnabled {
+                print("[HomeVM] refresh() cancelled")
+            }
         } catch {
             // Only show error if still the latest refresh
-            guard taskID == refreshTaskID else { return }
+            guard taskID == refreshTaskID else {
+                if loggingEnabled {
+                    print("[HomeVM] refresh() error discarded; newer task exists id=\(refreshTaskID) err=\(error)")
+                }
+                return
+            }
             setFailed((error as NSError).localizedDescription)
+            if loggingEnabled {
+                print("[HomeVM] refresh() failed: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -100,53 +170,75 @@ final class HomeViewModel: ObservableObject {
         isLoading = loading
         errorMessage = nil
         loadingState = loading ? .loading : .idle
+        if loggingEnabled {
+            print("[HomeVM] state -> \(loading ? "loading" : "idle")")
+        }
     }
 
     private func setLoaded() {
         isLoading = false
         errorMessage = nil
         loadingState = .loaded
+        if loggingEnabled {
+            print("[HomeVM] state -> loaded")
+        }
     }
 
     private func setFailed(_ message: String) {
         isLoading = false
         errorMessage = message
         loadingState = .failed(message)
+        if loggingEnabled {
+            print("[HomeVM] state -> failed '\(message)'")
+        }
     }
 
     private func setIdle() {
         isLoading = false
         loadingState = .idle
+        if loggingEnabled {
+            print("[HomeVM] state -> idle")
+        }
     }
 }
 
+// Keep a mock for previews/dev if needed; production will inject WeatherAPIService via AppContainer.
 struct MockWeatherService: WeatherService {
     func fetchCurrentWeather(for city: String) async throws -> CurrentWeather {
-        try await Task.sleep(nanoseconds: 450_000_000)
-        let options: [CurrentWeather] = [
-            .init(city: city, temperature: 72, condition: "Sunny", high: 76, low: 58, symbolName: "sun.max.fill", theme: .sunny),
-            .init(city: city, temperature: 61, condition: "Rain", high: 64, low: 55, symbolName: "cloud.rain.fill", theme: .rainy),
-            .init(city: city, temperature: 66, condition: "Windy", high: 69, low: 57, symbolName: "wind", theme: .windy),
-            .init(city: city, temperature: 34, condition: "Snow", high: 36, low: 28, symbolName: "snow", theme: .coldSnowy),
-            .init(city: city, temperature: 84, condition: "Humid", high: 90, low: 73, symbolName: "humidity.fill", theme: .hotHumid),
-            .init(city: city, temperature: 68, condition: "Fog", high: 70, low: 60, symbolName: "cloud.fog.fill", theme: .foggy),
-            .init(city: city, temperature: 59, condition: "Storm", high: 62, low: 52, symbolName: "cloud.bolt.rain.fill", theme: .stormy)
-        ]
-        return options.randomElement()!
+        // This mock is no longer used in production Home, but kept for previews.
+        return CurrentWeather(
+            city: city,
+            temperature: 72,
+            condition: "Sunny",
+            high: 76,
+            low: 58,
+            symbolName: "sun.max.fill",
+            theme: .sunny,
+            feelsLikeF: 74,
+            windKph: 12,
+            humidity: 50,
+            pressureMb: 1016,
+            visibilityKm: 10,
+            uvIndex: 5,
+            gustKph: 20,
+            windDirection: "W",
+            windDegrees: 270,
+            dewpointF: 50,
+            heatIndexF: 75,
+            aqiEPA: 2,
+            aqiDEFRA: 3,
+            pm25: 12,
+            pm10: 18,
+            sunrise: "6:42 AM",
+            sunset: "7:58 PM",
+            precipChance: 10
+        )
     }
 
     func fetch5DayForecast(for city: String) async throws -> [ForecastDay] {
-        try await Task.sleep(nanoseconds: 300_000_000)
         let weekdays = Calendar.current.shortWeekdaySymbols
-        let start = Int.random(in: 0..<weekdays.count)
-        let ordered = (0..<5).map { i in
-            weekdays[(start + i) % weekdays.count]
-        }
-        let symbols = ["sun.max.fill", "cloud.sun.fill", "cloud.rain.fill", "cloud.bolt.fill", "cloud.fog.fill", "wind", "snow"]
-        return ordered.map { day in
-            let low = Int.random(in: 40...70)
-            let high = low + Int.random(in: 4...18)
-            return ForecastDay(weekday: day, high: high, low: low, symbolName: symbols.randomElement()!)
+        return (0..<5).map { i in
+            ForecastDay(weekday: weekdays[(i + 1) % weekdays.count], high: 75 + i, low: 60 - i, symbolName: "sun.max.fill")
         }
     }
 }

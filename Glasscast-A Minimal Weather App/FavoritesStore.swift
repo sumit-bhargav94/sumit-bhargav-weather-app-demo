@@ -36,8 +36,8 @@ final class FavoritesStore: ObservableObject {
                 try await Task.sleep(nanoseconds: 200_000_000)
                 if favorites.isEmpty {
                     favorites = [
-                        FavoriteCity(id: UUID(), user_id: userID, city: "Cupertino", created_at: Date()),
-                        FavoriteCity(id: UUID(), user_id: userID, city: "London", created_at: Date())
+                        FavoriteCity(id: UUID(), user_id: userID, city: "Cupertino", country: "USA", created_at: Date(), lat: 37.3349, lon: -122.0090),
+                        FavoriteCity(id: UUID(), user_id: userID, city: "London", country: "UK", created_at: Date(), lat: 51.5072, lon: -0.1276)
                     ]
                 }
             } catch {
@@ -50,6 +50,7 @@ final class FavoritesStore: ObservableObject {
         defer { isLoading = false }
         do {
             favorites = try await service.fetchFavorites(for: userID)
+            print("favorites data for radarview = \(favorites.count)",favorites.description)
         } catch {
             errorMessage = (error as NSError).localizedDescription
         }
@@ -59,11 +60,12 @@ final class FavoritesStore: ObservableObject {
         favorites.first { $0.city.caseInsensitiveCompare(city) == .orderedSame }
     }
 
-    func toggle(city: String) async {
+    // New: toggle with optional lat/lon captured at add-time
+    func toggle(city: String, country: String, lat: Double? = nil, lon: Double? = nil) async {
         if let existing = isFavorite(city) {
             await remove(id: existing.id)
         } else {
-            await add(city: city)
+            await add(city: city, country: country, lat: lat, lon: lon)
         }
     }
 
@@ -84,14 +86,14 @@ final class FavoritesStore: ObservableObject {
         favorites.removeAll()
     }
 
-    private func add(city: String) async {
+    private func add(city: String, country: String, lat: Double?, lon: Double?) async {
         if mockMode {
-            let mock = FavoriteCity(id: UUID(), user_id: userID, city: city, created_at: Date())
+            let mock = FavoriteCity(id: UUID(), user_id: userID, city: city, country: country, created_at: Date(), lat: lat, lon: lon)
             favorites.insert(mock, at: 0)
             return
         }
         do {
-            let new = try await service.addFavorite(for: userID, city: city)
+            let new = try await service.addFavorite(for: userID, city: city, country: country, lat: lat, lon: lon)
             favorites.insert(new, at: 0)
         } catch {
             errorMessage = (error as NSError).localizedDescription
@@ -111,3 +113,4 @@ final class FavoritesStore: ObservableObject {
         }
     }
 }
+
